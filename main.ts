@@ -1,117 +1,94 @@
-// news-image-20261121 v4 — entrypoint.
-//
-// Validates the front-page PNG this repository holds (PNG signature,
-// IHDR 1024x1024, IEND trailer, at most 1 MiB) and copies it to the
-// grader output directory. The copy is byte-identical by construction:
-// the program writes nothing of its own, so both grader runs produce
-// the same bytes.
-//
-// The output directory itself is never removed: the grader mounts
-// /output, and removing a mount point fails (EBUSY). Only its
-// contents are cleared before the copy.
-
+/**
+ * news-image-20261121 v5 entrypoint.
+ *
+ * Runs render.py (draws entry.png deterministically with Pillow), validates
+ * the PNG (signature, IHDR 1024x1024, chunk CRCs, IEND), and copies it to
+ * MAKEFUN_OUTPUT_DIR. The output directory itself is never removed: only its
+ * contents are cleared, because the grader mounts it (rmSync on a mount
+ * point fails with EBUSY).
+ */
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
   mkdirSync,
-  readdirSync,
   readFileSync,
+  readdirSync,
   rmSync,
+  statSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const SRC = join(HERE, "entry.png");
-const OUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? join(HERE, "out");
-const OUT = join(OUT_DIR, "entry.png");
-
-const PNG_MAGIC = Buffer.from([
-  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-]);
+const repoDir = dirname(fileURLToPath(import.meta.url));
+const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? "out";
 
 function fail(message: string): never {
-  console.error(`entry: ${message}`);
+  console.error(`error: ${message}`);
   process.exit(1);
 }
 
-function sha256(path: string): string {
-  return createHash("sha256").update(readFileSync(path)).digest("hex");
-}
-
-// --- validate the image -------------------------------------------------
-if (!existsSync(SRC)) fail("entry.png is missing from the repository");
-const png = readFileSync(SRC);
-if (png.length > 1048576) {
-  fail(`entry.png is ${png.length} bytes, over the 1 MiB cap`);
-}
-if (png.length < 8 || !png.subarray(0, 8).equals(PNG_MAGIC)) {
-  fail("entry.png does not start with the PNG signature");
-}
-const ihdrLength = png.readUInt32BE(8);
-const ihdrType = png.toString("ascii", 12, 16);
-if (ihdrType !== "IHDR" || ihdrLength !== 13) {
-  fail("entry.png has no valid IHDR chunk");
-}
-const width = png.readUInt32BE(16);
-const height = png.readUInt32BE(20);
-if (width !== 1024 || height !== 1024) {
-  fail(`entry.png is ${width}x${height}, must be 1024x1024`);
-}
-// CRC-32 (IEEE polynomial) over a chunk's type + data, as the PNG
-// spec stores it. Verifies every chunk the file carries.
-const CRC_TABLE: number[] = [];
-for (let n = 0; n < 256; n++) {
-  let c = n;
-  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-  CRC_TABLE[n] = c >>> 0;
-}
-function crc32(buf: Buffer): number {
-  let c = 0xffffffff;
-  for (const byte of buf) c = CRC_TABLE[(c ^ byte) & 0xff] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
-}
-
-// Walk the chunk list: every chunk must fit inside the file, carry a
-// matching CRC, and the file must end with the IEND chunk. At least
-// one IDAT chunk must be present.
-let offset = 8;
-let sawIend = false;
-let sawIdat = false;
-while (offset + 8 <= png.length) {
-  const length = png.readUInt32BE(offset);
-  const type = png.toString("ascii", offset + 4, offset + 8);
-  if (offset + 12 + length > png.length) {
-    fail(`chunk ${type} at offset ${offset} runs past the end of the file`);
+function validatePng(path: string): void {
+  const buf = readFileSync(path);
+  const pngSig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+let crcTable: number[] | undefined;
+function pngCrcTable(): number[] {
+  if (crcTable) return crcTable;
+  crcTable = [];
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    crcTable[n] = c >>> 0;
   }
-  const storedCrc = png.readUInt32BE(offset + 8 + length);
-  const actualCrc = crc32(png.subarray(offset + 4, offset + 8 + length));
-  if (storedCrc !== actualCrc) {
-    fail(`chunk ${type} at offset ${offset} has a bad CRC`);
+  return crcTable;
+}
+  if (buf.length < 8 || !buf.subarray(0, 8).equals(pngSig)) {
+    fail(`${path}: not a PNG`);
   }
-  if (type === "IDAT") sawIdat = true;
-  offset += 12 + length;
-  if (type === "IEND") {
-    sawIend = true;
-    break;
+  let off = 8;
+  let sawIhdr = false;
+  let sawIend = false;
+  while (off + 8 <= buf.length) {
+    const len = buf.readUInt32BE(off);
+    const type = buf.subarray(off + 4, off + 8).toString("ascii");
+    if (off + 12 + len > buf.length) fail(`${path}: truncated ${type} chunk`);
+    const storedCrc = buf.readUInt32BE(off + 8 + len);
+    const table = pngCrcTable();
+    let crc = 0xffffffff;
+    for (let i = off + 4; i < off + 8 + len; i++) {
+      crc = table[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
+    }
+    if ((crc ^ 0xffffffff) >>> 0 !== storedCrc) fail(`${path}: bad CRC in ${type}`);
+    if (type === "IHDR") {
+      sawIhdr = true;
+      const w = buf.readUInt32BE(off + 8);
+      const h = buf.readUInt32BE(off + 12);
+      if (w !== 1024 || h !== 1024) fail(`${path}: expected 1024x1024, got ${w}x${h}`);
+    }
+    if (type === "IEND") sawIend = true;
+    off += 12 + len;
   }
+  if (!sawIhdr || !sawIend) fail(`${path}: missing IHDR or IEND`);
 }
-if (!sawIend) fail("entry.png has no IEND chunk");
-if (!sawIdat) fail("entry.png has no IDAT chunk");
-if (offset !== png.length) fail("entry.png has bytes after the IEND chunk");
 
-// --- copy it to the output directory ------------------------------------
-mkdirSync(OUT_DIR, { recursive: true });
-for (const name of readdirSync(OUT_DIR)) {
-  rmSync(join(OUT_DIR, name), { recursive: true, force: true });
-}
-copyFileSync(SRC, OUT);
+function main(): void {
+  mkdirSync(outDir, { recursive: true });
+  for (const f of readdirSync(outDir)) {
+    rmSync(join(outDir, f), { recursive: true, force: true });
+  }
 
-// --- the output must be byte-identical to the source --------------------
-const sourceHash = sha256(SRC);
-const outputHash = sha256(OUT);
-if (sourceHash !== outputHash) {
-  fail(`output differs from entry.png: ${outputHash} != ${sourceHash}`);
+  const py = spawnSync("python3", ["render.py"], { cwd: repoDir, stdio: "inherit" });
+  if (py.status !== 0) fail(`render.py exited with status ${py.status}`);
+
+  const src = join(repoDir, "entry.png");
+  if (!existsSync(src)) fail("render.py did not write entry.png");
+  validatePng(src);
+  const size = statSync(src).size;
+  if (size > 1048576) fail(`entry.png is ${size} bytes, over the 1 MiB cap`);
+  copyFileSync(src, join(outDir, "entry.png"));
+  const sha = createHash("sha256").update(readFileSync(src)).digest("hex");
+  console.log(`entry.png ${size} bytes sha256 ${sha}`);
 }
-console.log(`entry.png ${png.length} bytes sha256 ${sourceHash} -> ${OUT}`);
+
+main();
